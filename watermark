@@ -1,0 +1,140 @@
+# High-watermark tracking in Databricks for Foundry migration
+
+**Databricks replaces Foundry's automatic transaction-based incrementality with a checkpoint-based streaming model that gives more control but demands explicit configuration.** The closest equivalent to Foundry's `@incremental` decorator is Structured Streaming with `trigger(availableNow=True)` inside Spark Declarative Pipelines (SDP), which processes only new data in scheduled batches—mirroring Foundry's "build" semantics. For sources like Teradata CDC where streaming semantics don't apply natively, a custom high-watermark control table in Delta provides the state persistence that Foundry handled automatically. This report maps every Foundry incremental pattern to its Databricks counterpart and details implementation across Bronze ingestion and Silver transform layers.
+
+---
+
+## How SDP internally tracks what has been processed
+
+Streaming tables in Spark Declarative Pipelines are built on Apache Spark Structured Streaming. Each flow writing to a streaming table maintains a **checkpoint** containing four components: offsets (which source positions have been processed), commits (which micro-batches reached the sink), intermediate state (for stateful operations like aggregations or dedup), and query metadata. This checkpoint enables exactly-once semantics—on failure, the pipeline resumes from the last committed micro-batch rather than reprocessing everything.
+
+**Auto Loader** (the `cloudFiles` source) uses a **RocksDB key-value store** within its checkpoint to track discovered files. This is purely checkpoint-based, not watermark-column-based: Auto Loader records which files it has seen regardless of any timestamp column in the data. In directory listing mode it periodically scans the input path; in file notification mode (recommended for ADLS Gen2 at scale) it receives push notifications via Azure Event Grid. Within SDP pipelines, you do not specify checkpoint or schema locations—the pipeline manages both automatically.
+
+**AUTO CDC** (formerly `APPLY CHANGES INTO`) writes to a streaming table and inherits the same checkpoint infrastructure. It maintains its own internal ordering state using the `SEQUENCE BY` column to handle out-of-order events. **Users do not need to manage CDC state**—the framework handles deduplication, sequencing, and incremental processing automatically. The operation is idempotent: the Databricks documentation explicitly notes "no data duplication for auto CDC."
+
+For **Unity Catalog pipelines**, checkpoints are stored in the managed storage area of the containing schema (e.g., `abfss://<container>@<account>.dfs.core.windows.net/managed/__unitystorage/catalogs/<id>/checkpoints/`). Users **cannot directly access or delete** these checkpoints. The only reset mechanisms are: (1) full table refresh via `REFRESH FULL`, which clears both data and checkpoints; (2) selective checkpoint reset via the REST API (`reset_checkpoint_selection`), which clears checkpoints but preserves table data; or (3) setting the table property `pipelines.reset.allowed = false` to prevent accidental full refreshes.
+
+**Materialized views** use an entirely different mechanism. Rather than Structured Streaming checkpoints, they leverage Delta Lake's **Change Data Feed and row tracking** to detect what changed in source tables since the last refresh. The Enzyme engine runs a cost analysis and automatically chooses between incremental refresh and full recompute. Incremental refresh requires `delta.enableRowTracking = true` on source tables and runs only on serverless pipelines.
+
+---
+
+## Custom high-watermark tables for non-streaming sources
+
+When ingesting from JDBC sources like Teradata—where Structured Streaming's file-based tracking doesn't apply—you need a **custom watermark control table**. The recommended schema stores per-source watermark values as strings (for type universality) with a discriminator column:
+
+```sql
+CREATE TABLE metadata.pipeline_control.ingestion_watermarks (
+  source_system       STRING NOT NULL,
+  source_table        STRING NOT NULL,
+  watermark_column    STRING NOT NULL,
+  watermark_value     STRING NOT NULL,
+  watermark_type      STRING NOT NULL,   -- "timestamp", "epoch_ms", "date", "bigint"
+  last_run_status     STRING,
+  last_run_timestamp  TIMESTAMP,
+  rows_processed      BIGINT,
+  updated_by          STRING
+) USING DELTA
+TBLPROPERTIES (delta.enableChangeDataFeed = true);
+```
+
+Place this table in a **dedicated metadata catalog** (e.g., `metadata.pipeline_control`) to isolate operational state from business data and simplify access control for pipeline service principals.
+
+The critical pattern for atomic updates: read watermark → extract data using pushdown predicate → compute new watermark from extracted data → write data to target → update watermark via `MERGE INTO` only after successful write. Delta's ACID transactions ensure the watermark update is atomic. If the job fails before the MERGE, the next run re-reads the same data, and the MERGE on the target table handles idempotency.
+
+For **passing watermarks between Databricks Workflow tasks**, use `dbutils.jobs.taskValues`:
+
+```python
+# Task A: set watermark after extraction
+dbutils.jobs.taskValues.set(key="last_watermark", value=str(new_watermark))
+
+# Task B: retrieve watermark (programmatic)
+wm = dbutils.jobs.taskValues.get(taskKey="extract_task", key="last_watermark")
+
+# Or via dynamic reference in task configuration:
+# {{tasks.extract_task.values.last_watermark}}
+```
+
+Task values are **Python-only**, support up to 48 KiB per value, and the dynamic reference syntax (`{{tasks.X.values.Y}}`) works across all task types. For within-task parameter passing, `spark.conf.set/get` works but is limited to the same SparkSession.
+
+**Lakeflow Connect** now supports Teradata as of March 2026. It performs an initial full snapshot, then ingests only changes on subsequent runs using a **cursor-based position tracking** approach. The connector stores the last cursor position and resumes from there. For Teradata specifically (which lacks native change tracking), it likely uses a configured timestamp/watermark column for incremental reads.
+
+---
+
+## Standardizing watermarks across dozens of source tables
+
+When ingesting from many Teradata tables with heterogeneous timestamp columns (`_tm`, `_dt`, `_TMSTMP` suffixes, epoch milliseconds vs. parsed timestamps), the solution is a **metadata-driven source registry** that maps each source to its watermark configuration:
+
+```sql
+CREATE TABLE metadata.pipeline_control.source_registry (
+  source_system        STRING NOT NULL,
+  source_table         STRING NOT NULL,
+  primary_keys         STRING NOT NULL,
+  watermark_column     STRING NOT NULL,   -- actual column name: "update_tm", "LAST_UPD_TMSTMP"
+  watermark_type       STRING NOT NULL,   -- "timestamp", "epoch_ms", "date"
+  target_table         STRING,
+  lookback_minutes     INT DEFAULT 30,
+  is_active            BOOLEAN DEFAULT true
+) USING DELTA;
+```
+
+A generic extraction function reads this registry and **branches on `watermark_type`** to construct the appropriate JDBC pushdown predicate: `TIMESTAMP '...'` for timestamps, raw numeric comparison for epoch milliseconds, `DATE '...'` for dates. The watermark control table always stores values as strings; type conversion happens at read and write time. On the Bronze target side, add standardized metadata columns (`_ingested_at`, `_source_watermark_value`) for downstream traceability.
+
+For **composite ordering** (multiple timestamp columns defining sequence, analogous to Foundry's `order_cols`), AUTO CDC supports `SEQUENCE BY STRUCT(timestamp_col, sequence_id)`, which orders by the first field and breaks ties with subsequent fields. For standard streaming without AUTO CDC, derive a single monotonic column that encodes the composite order, since Structured Streaming watermarks only support a single timestamp column.
+
+A **30-minute lookback window** is recommended for JDBC extracts to catch late-arriving records: subtract a safety buffer from the stored watermark, then rely on `MERGE INTO` at the target to deduplicate overlapping records.
+
+---
+
+## Bronze and Silver layer patterns compared
+
+**Bronze layer** (ingestion) tracking differs by source type:
+
+- **CDC files landing in ADLS Gen2**: Auto Loader with file notification mode provides exactly-once file tracking via its RocksDB checkpoint. No watermark column needed—tracking is file-based. Use `trigger(availableNow=True)` for batch-like processing of accumulated files.
+- **Direct JDBC from Teradata**: Custom watermark table + parameterized pushdown queries. The JDBC query includes `WHERE modified_tm > TIMESTAMP '{last_watermark}'`, partitioned across multiple parallel readers via `numPartitions`/`partitionColumn`.
+- **Lakeflow Connect**: Fully managed cursor-based tracking. The connector handles initial snapshot, incremental position, and staging automatically.
+
+**Silver layer** (transform/dedup) tracking depends on transformation complexity:
+
+**Streaming tables** are best for Silver when transforms are row-level (filter, clean, parse, type-cast) and Bronze is append-only. The streaming table reads from Bronze via `readStream`, and the checkpoint tracks Delta transaction log versions automatically. No explicit watermark management needed. For CDC deduplication, AUTO CDC with `KEYS` and `SEQUENCE BY` handles ordering and dedup declaratively.
+
+**Materialized views** are best for Silver when transforms involve joins with changing dimension tables, complex aggregations, or when Bronze has updates/deletes. MVs always return correct results regardless of data arrival order—they are **inherently tolerant of late-arriving data** because the Enzyme engine can recompute affected results. This is a significant advantage over streaming tables for correctness-critical transformations.
+
+**Change Data Feed is not required for append-only Bronze-to-Silver reads**—`readStream` on a Delta table already provides incremental semantics for appends. CDF becomes essential when Bronze receives updates or deletes (e.g., from MERGE operations). With CDF enabled, `readStream` with `readChangeFeed=true` captures row-level change events including pre/post images for updates.
+
+For **late-arriving data**, streaming tables offer `withWatermark()` to define a tolerance threshold—records within the threshold are guaranteed to be processed, while records outside may be dropped. Materialized views handle late data automatically since they can recompute. The practical choice: use a wider watermark threshold, use MVs for correctness-critical Silver tables, or run periodic catch-up jobs.
+
+For **deduplication**, `dropDuplicatesWithinWatermark()` (available since DBR 13.3) is the recommended approach. It deduplicates within the watermark window and automatically evicts state after the watermark passes, preventing unbounded state growth.
+
+---
+
+## How Foundry and Databricks incrementality fundamentally differ
+
+The two platforms take architecturally distinct approaches to incremental processing:
+
+| Aspect | Palantir Foundry | Databricks |
+|--------|-----------------|------------|
+| **Model** | Transaction-based: each build = transaction; `mode="added"` reads only new transactions | Checkpoint-based: Structured Streaming tracks source offsets in persistent checkpoints |
+| **State management** | Fully automatic—platform determines incrementality from transaction history | User configures checkpoint locations (or SDP manages them automatically) |
+| **Failure handling** | Automatic rollback—failed builds don't commit; next build retries transparently | Checkpoint recovery—stream resumes from last committed micro-batch; `foreachBatch` must be idempotent |
+| **Fallback behavior** | Automatic fallback to snapshot if incrementality conditions aren't met | Stream fails on non-append upstream changes; user must configure `skipChangeCommits`, use CDF, or reset checkpoint |
+| **Read modes** | `added`, `previous`, `current` on both input and output | `readStream` (new data), `spark.read.table()` (current snapshot), time travel (historical versions) |
+
+**Foundry's `mode="added"`** maps to `spark.readStream.table("source")` in Databricks. Both process only new data since the last successful run. The key difference: Foundry determines "new" via transaction boundaries, while Databricks tracks "new" via Delta version offsets in the checkpoint. Using `trigger(availableNow=True)` makes the Databricks stream behave like a Foundry build—process all available new data, then stop.
+
+**Foundry's `output.dataframe('previous')`** has no single equivalent. The closest patterns: (1) `MERGE INTO` the target table in a `foreachBatch` handler, where the target table itself is the "previous output"; (2) `spark.read.table("target")` to read the current state of the output before writing; (3) materialized views, which abstract away the merge entirely by declaring the desired query and letting Databricks handle incremental refresh.
+
+**Foundry's `semantic_version` bump** (forcing a full recompute when logic changes) maps to deleting the checkpoint and restarting, or running `REFRESH FULL` in SDP. Foundry's `snapshot_inputs` (reference tables always read in full) maps to **stream-static joins** where a static DataFrame is joined with a streaming one. Foundry's `allow_retention` (ignoring retention deletes) maps to the `skipChangeCommits` option on Delta streaming reads.
+
+The most seamless migration path for batch-oriented Foundry incremental transforms is **Structured Streaming with `trigger(availableNow=True)`** inside SDP streaming tables. This provides the same "process only new data in a scheduled batch" semantics as Foundry builds, with checkpoint-based exactly-once guarantees, and SDP handles all checkpoint management automatically.
+
+---
+
+## Conclusion: an implementation decision framework
+
+The migration from Foundry's `@incremental` framework to Databricks requires choosing the right incremental mechanism for each pipeline stage. Three key decisions drive the architecture:
+
+**First, Bronze ingestion mechanism.** For CDC files landing in ADLS Gen2, Auto Loader inside SDP streaming tables provides fully managed exactly-once file tracking with zero watermark management. For direct JDBC pulls from Teradata, build a custom watermark control table in Unity Catalog and use metadata-driven extraction with pushdown predicates. For supported sources, Lakeflow Connect eliminates custom code entirely.
+
+**Second, Silver transform type.** Use streaming tables for row-level transforms (filter, clean, type-cast) on append-only Bronze sources—the checkpoint handles incrementality automatically. Use materialized views for joins with dimension tables, complex aggregations, or sources with updates/deletes—the Enzyme engine handles incremental refresh and guarantees correctness even with late-arriving data. Use AUTO CDC with `SEQUENCE BY STRUCT(...)` for CDC deduplication with composite ordering.
+
+**Third, state management strategy.** Inside SDP pipelines, trust the framework—checkpoints are managed automatically, and the only user actions are full refresh or selective checkpoint reset. Outside SDP (Databricks Workflows, standalone notebooks), build explicit watermark control tables with atomic `MERGE INTO` updates and pass watermarks between tasks via `dbutils.jobs.taskValues`. The `trigger(availableNow=True)` pattern bridges the gap, providing Foundry-style batch incrementality with Databricks streaming semantics.

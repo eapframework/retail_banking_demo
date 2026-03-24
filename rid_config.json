@@ -1,0 +1,22 @@
+{
+    "hostname": "myorg.palantirfoundry.com",
+
+    "governed_datasets": [
+        {
+            "rid": "ri.foundry.main.dataset.aaaa-1111-bbbb-2222",
+            "path": "/Organization/Project/bronze/source_system_a"
+        },
+        {
+            "rid": "ri.foundry.main.dataset.cccc-3333-dddd-4444",
+            "path": "/Organization/Project/bronze/source_system_b"
+        },
+        {
+            "rid": "ri.foundry.main.dataset.eeee-5555-ffff-6666",
+            "path": "/Organization/Project/silver/transformed_dataset_x"
+        }
+    ],
+    "output_rid": "ri.foundry.main.dataset.0000-governed-profile-output",
+
+    "adhoc_control_rid": "ri.foundry.main.dataset.9999-adhoc-control-table",
+    "adhoc_output_rid": "ri.foundry.main.dataset.0000-adhoc-profile-output"
+}

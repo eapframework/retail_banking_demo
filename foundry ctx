@@ -1,0 +1,23 @@
+from transforms.api import transform, Input, Output, TransformContext
+from pyspark.sql import Row
+ 
+@transform(
+    input_data=Input("ri.foundry.main.dataset.YOUR_INPUT_DATASET_RID"),
+    output=Output("ri.foundry.main.dataset.YOUR_OUTPUT_DATASET_RID"),
+)
+def my_transform(ctx: TransformContext, input_data, output):
+    # Read the input dataset as a Spark DataFrame
+    df = input_data.dataframe()
+   
+    # Collect rows and process inside a loop
+    processed_rows = []
+    for row in df.collect():
+        # Example: Only keep rows where age > 28
+        if row["age"] > 28:
+            processed_rows.append(Row(name=row["name"], age=row["age"]))
+   
+    # Create a new DataFrame from the processed rows
+    new_df = ctx.spark_session.createDataFrame(processed_rows)
+   
+    # Write the new DataFrame to the output dataset
+    output.write_dataframe(new_df)

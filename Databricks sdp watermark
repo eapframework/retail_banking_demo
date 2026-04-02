@@ -1,0 +1,122 @@
+# Watermarks in Spark Declarative Pipelines: the complete guide
+
+**Watermarks in SDP work exactly like standard Structured Streaming — you call `.withWatermark()` imperatively on your streaming DataFrame inside `@dp.table` or `@dp.append_flow` functions.** There is no declarative watermark parameter on any SDP decorator or function. What SDP does abstract away are checkpoints, trigger modes, and output mode. The triggered pipeline mode maps to `Trigger.AvailableNow` internally, which means the watermark advances across micro-batches within a single pipeline run, a no-data batch fires at the end to emit finalized results, and watermark state persists across runs via managed checkpoints. This behavior creates specific tradeoffs — particularly around backfill safety and append-only output — that this report covers in detail.
+
+## How to define watermarks in the `pyspark.pipelines` API
+
+The `pyspark.pipelines` module (imported as `from pyspark import pipelines as dp`) introduces no new watermark mechanism. Watermarks are set imperatively via `.withWatermark("column", "threshold")` on the streaming DataFrame returned from your decorated function. Databricks states explicitly: "To ensure queries that perform aggregations are processed incrementally and not fully recomputed with each update, you **must** use watermarks." [Databricks](https://docs.databricks.com/aws/en/ldp/stateful-processing) [Microsoft Learn](https://learn.microsoft.com/en-us/azure/databricks/ldp/stateful-processing)
+
+In Python, a windowed aggregation with a watermark looks like this:
+
+```python
+from pyspark import pipelines as dp
+from pyspark.sql.functions import window, count
+
+@dp.table()
+def event_counts():
+    return (
+        spark.readStream.table("events_raw")
+            .withWatermark("event_time", "3 minutes")
+            .groupBy(window("event_time", "1 minute").alias("time_window"), "region")
+            .agg(count("*").alias("cnt"))
+    )
+```
+
+In SQL, the equivalent uses the `WATERMARK` clause:
+
+```sql
+CREATE OR REFRESH STREAMING TABLE event_counts AS
+SELECT window(event_time, '1 minute') AS time_window, region, COUNT(*) AS cnt
+FROM STREAM(events_raw)
+  WATERMARK event_time DELAY OF INTERVAL 3 MINUTES
+GROUP BY time_window, region;
+```
+[Databricks](https://docs.databricks.com/aws/en/ldp/best-practices)
+
+Neither `@dp.table()`, `@dp.append_flow()`, nor `dp.create_streaming_table()` accept a watermark parameter. [Databricks](https://docs.databricks.com/aws/en/ldp/developer/ldp-python-ref-append-flow) The migration from the old `import dlt` module to `pyspark.pipelines` leaves watermark handling completely unchanged — only the import and decorator names change. [Databricks](https://docs.databricks.com/aws/en/ldp/where-is-dlt)
+
+## Watermark behavior under triggered (batch) execution
+
+SDP's pipeline execution mode determines how the underlying Structured Streaming trigger is configured. **Triggered mode — the batch-style execution — maps to `Trigger.AvailableNow` internally.** Users select triggered or continuous at the pipeline level; they do not call `.trigger()` directly. Understanding how `Trigger.AvailableNow` handles watermarks is therefore critical to understanding SDP behavior.
+
+**The watermark advances per micro-batch within a single pipeline run.** When rate limits (like `maxFilesPerTrigger`) split available data across multiple micro-batches, the watermark computed at the end of batch N takes immediate effect in batch N+1 within the same invocation. Jungtaek Lim, the Spark Structured Streaming maintainer, confirmed this directly: "Each batch advances the watermark and it's immediately reflected on the next batch." [mail-archive](https://www.mail-archive.com/dev@spark.apache.org/msg29262.html)
+
+Three mechanical details matter most here. First, **a no-data batch runs at the end** of every `Trigger.AvailableNow` invocation if the final data batch advanced the watermark. [Apache Spark](https://spark.apache.org/docs/latest/api/java/org/apache/spark/sql/streaming/Trigger.html) This no-data batch emits finalized window results, produces outer join null rows for unmatched keys, and cleans up expired state — all before the pipeline run terminates. This is a significant advantage over the deprecated `Trigger.Once`, which deferred these operations to the next run. [Apache JIRA](https://issues.apache.org/jira/browse/SPARK-39805) [The Mail Archive](https://www.mail-archive.com/dev@spark.apache.org/msg29262.html)
+
+Second, **watermark state persists across pipeline runs** via the checkpoint's offset log. When the next triggered run starts, the engine restores the last committed watermark value and uses it as the starting point. The watermark never decrements. If Run 1 sees max event time of 12:30 with a 10-minute threshold, the watermark settles at 12:20. Run 2 starts from 12:20 — any data arriving with event time before 12:20 gets dropped, even if days elapse between runs.
+
+Third, **late data is still dropped.** The watermark mechanism operates identically regardless of trigger type. The guarantee is one-directional: data newer than the watermark is guaranteed to be accepted; data older **may** be dropped. [Apache Spark](https://spark.apache.org/docs/latest/streaming/apis-on-dataframes-and-datasets.html) [Databricks](https://docs.databricks.com/aws/en/structured-streaming/watermarks) In practice, data older than the watermark threshold is routinely discarded during stateful operations.
+
+| Aspect | `Trigger.Once` (deprecated) | `Trigger.AvailableNow` (SDP triggered mode) |
+|---|---|---|
+| Micro-batches per run | Always 1 | Multiple (respects rate limits) |
+| Watermark advancement | Once; takes effect next run | Per micro-batch; immediate |
+| No-data batch | No | Yes, if watermark advanced |
+| Output latency (append mode) | Deferred to next run | Emitted in same run |
+| Backfill safety | Safer (single batch, no mid-run drops) | Riskier (progressive advancement can drop older data) |
+
+## Windowed aggregations, joins, and dedup in SDP
+
+SDP streaming tables operate exclusively in **append output mode**. The documentation confirms: "Currently, only the Append flow is exposed." [Databricks](https://docs.databricks.com/aws/en/ldp/concepts) This has a direct consequence for windowed aggregations: results are emitted **only after the watermark closes the window**, introducing a minimum delay equal to the watermark threshold. For update or complete mode semantics, Databricks recommends materialized views instead. [Databricks](https://www.databricks.com/blog/feature-deep-dive-watermarking-apache-spark-structured-streaming)
+
+**Tumbling and sliding windows** are fully documented with SDP examples. Session windows are supported by the underlying Spark engine (since Spark 3.2) but are **not explicitly shown** in SDP documentation — treat them as usable but less battle-tested in this context. The `window()` function must reference the same timestamp column used in `withWatermark()`. [Databricks Community](https://community.databricks.com/t5/data-engineering/dlt-streaming-with-watermark-fails-suggesting-i-should-add/td-p/113070)
+
+**Stream-stream joins** require watermarks on both input streams plus a time-bounded join condition. [Databricks](https://docs.databricks.com/aws/en/ldp/stateful-processing) The `@dp.append_flow` pattern is the recommended approach: [databricks](https://docs.databricks.com/aws/en/ldp/stateful-processing)
+
+```python
+dp.create_streaming_table("impression_clicks")
+
+@dp.append_flow(target="impression_clicks")
+def join_impressions_clicks():
+    impressions = spark.readStream.table("ad_impressions") \
+        .withWatermark("impression_time", "3 minutes")
+    clicks = spark.readStream.table("user_clicks") \
+        .withWatermark("click_time", "3 minutes")
+    return impressions.alias("imp").join(
+        clicks.alias("clk"),
+        expr("""imp.ad_id = clk.ad_id
+            AND clk.click_time BETWEEN imp.impression_time
+            AND imp.impression_time + INTERVAL 3 MINUTES"""),
+        "leftOuter"
+    )
+```
+
+For outer joins, the watermark determines when to emit null rows for unmatched keys [Databricks](https://docs.databricks.com/aws/en/structured-streaming/watermarks) — the no-data batch at the end of a triggered run handles this. Without both watermarks and the time-bound condition, state grows unboundedly and the pipeline will eventually OOM. [Databricks](https://docs.databricks.com/aws/en/structured-streaming/watermarks) [Microsoft Learn](https://learn.microsoft.com/en-us/azure/databricks/ldp/best-practices)
+
+**Deduplication via `dropDuplicatesWithinWatermark()`** requires a prior `.withWatermark()` call and is fully supported in SDP. [Microsoft Learn](https://learn.microsoft.com/en-us/azure/databricks/structured-streaming/watermarks) [Microsoft Learn](https://learn.microsoft.com/en-us/azure/databricks/ldp/stateful-processing) The `withEventTimeOrder` option is particularly important here to prevent the watermark from jumping ahead during initial snapshot processing. [Azure Docs](https://docs.azure.cn/en-us/databricks/dlt/stateful-processing)
+
+When joining multiple streams, the engine maintains **one global watermark based on the slowest stream** [Microsoft Learn](https://learn.microsoft.com/en-us/azure/databricks/ldp/stateful-processing) [Databricks](https://docs.databricks.com/aws/en/ldp/stateful-processing) (min policy by default). This can be changed via `spark.sql.streaming.multipleWatermarkPolicy` set to `max`, though this risks dropping data from slower streams. [Databricks](https://docs.databricks.com/aws/en/structured-streaming/watermarks) [Microsoft Learn](https://learn.microsoft.com/en-us/azure/databricks/structured-streaming/watermarks)
+
+## Source-specific interactions and the backfill trap
+
+**Auto Loader** (`cloudFiles`) does not guarantee file processing order. When a watermark is applied downstream of Auto Loader, the `withEventTimeOrder` option becomes critical for the initial snapshot. Without it, files processed by modification time can cause records to be dropped as late events when the watermark advances past their event times. [Databricks](https://docs.databricks.com/aws/en/structured-streaming/delta-lake) [Microsoft Learn](https://learn.microsoft.com/en-us/azure/databricks/ldp/stateful-processing) The typical pattern is: Auto Loader → bronze (no watermark) → silver/gold (watermark + aggregation). SDP automatically manages Auto Loader's schema location and checkpoint.
+
+**Delta Change Data Feed** sources are best handled through `dp.create_auto_cdc_flow()` (formerly `APPLY CHANGES INTO`), which manages ordering and deduplication automatically without requiring explicit watermarks. For manual CDF reads with watermarks, note that `withEventTimeOrder` does **not** work when "there is a watermark that has more than one Delta source in the stream query." [Databricks](https://docs.databricks.com/aws/en/structured-streaming/delta-lake) Upstream mutations (UPDATE, DELETE, MERGE) to Delta source tables can also cause streaming failures; use `skipChangeCommits` or CDF-specific approaches. [Databricks](https://docs.databricks.com/aws/en/structured-streaming/delta-lake)
+
+**Reading from other SDP tables** via `spark.readStream.table("upstream_table")` works normally with watermarks. The chained medallion pattern — bronze → silver → gold with increasingly refined watermarked operations — is the recommended architecture.
+
+The most dangerous gotcha is **the backfill trap with `Trigger.AvailableNow`**. When reprocessing large historical datasets, rate limits split data into multiple micro-batches. If earlier batches happen to contain data with more recent event times (because file modification order doesn't match event-time order), the watermark advances aggressively. Subsequent batches containing older event-time data get **silently dropped**. [Microsoft Learn](https://learn.microsoft.com/en-us/azure/databricks/ldp/stateful-processing) The Spark maintainers acknowledge this explicitly. [mail-archive](https://www.mail-archive.com/dev@spark.apache.org/msg29262.html) Four workarounds exist:
+
+- Enable `withEventTimeOrder` for Delta sources (`spark.databricks.delta.withEventTimeOrder.enabled = true`) [Databricks](https://docs.databricks.com/aws/en/structured-streaming/delta-lake) — Python only, not SQL [Microsoft Learn](https://learn.microsoft.com/en-us/azure/databricks/ldp/stateful-processing) [Azure Docs](https://docs.azure.cn/en-us/databricks/dlt/stateful-processing)
+- Set source rate limits high enough to force a single batch during backfill (sacrificing scalability)
+- Temporarily increase the watermark threshold to an unrealistically large value during backfill
+- Use RocksDB state store to tolerate large state without watermark-driven eviction [mail-archive](https://www.mail-archive.com/dev@spark.apache.org/msg29262.html)
+
+## Key limitations compared to raw Structured Streaming
+
+SDP abstracts away several controls that raw Structured Streaming exposes directly. **Checkpoint locations are internal and not user-accessible.** Users cannot specify checkpoint paths, and each flow maintains its own checkpoint. **Trigger configuration is controlled at the pipeline level** (triggered vs. continuous plus `pipelines.trigger.interval`), not per-stream. **Output mode is locked to append** for streaming tables.
+
+The most consequential limitation is that **changing watermark logic requires a full refresh**. Modifying the watermark threshold, aggregation columns, or join conditions makes existing checkpoint state incompatible. [Databricks](https://docs.databricks.com/aws/en/structured-streaming/checkpoints) A full refresh reprocesses all data from scratch, clearing checkpoints and state entirely. If the upstream source has limited retention (like Kafka with a short TTL), this can cause permanent data loss. [Databricks Documentation](https://docs.databricks.com/gcp/en/ldp/best-practices) The medallion architecture mitigates this by preserving raw data in bronze tables.
+
+Databricks recommends **RocksDB-based state management** for all stateful streaming workloads. [Microsoft Learn](https://learn.microsoft.com/en-us/azure/databricks/ldp/stateful-processing) On classic compute, configure `spark.sql.streaming.stateStore.providerClass` to `com.databricks.sql.streaming.state.RocksDBStateStoreProvider`. [Azure Docs](https://docs.azure.cn/en-us/databricks/dlt/stateful-processing) Serverless pipelines handle this automatically. [Microsoft Learn](https://learn.microsoft.com/en-us/azure/databricks/ldp/stateful-processing) RocksDB became the default state provider in Databricks Runtime 17.2. [Microsoft Learn](https://learn.microsoft.com/en-us/azure/databricks/ldp/flow-examples)
+
+For monitoring, query the pipeline event log for watermark and state metrics:
+
+```sql
+SELECT * FROM event_log('<pipeline-id>') WHERE event_type = 'flow_progress'
+```
+[Microsoft Learn](https://learn.microsoft.com/en-us/azure/databricks/ldp/best-practices) [Databricks](https://docs.databricks.com/aws/en/ldp/best-practices)
+
+## Conclusion
+
+Watermarks in SDP are powerful but demand careful reasoning about three interacting layers: the imperative watermark API (unchanged from Structured Streaming), SDP's abstracted execution model (triggered mode = `Trigger.AvailableNow`, append-only output, managed checkpoints), and source-specific ordering behaviors (Auto Loader file order, Delta snapshot processing, CDF limitations). The no-data batch in `Trigger.AvailableNow` is the single most important mechanical detail — it ensures finalized results are emitted and state is cleaned within each pipeline run, [Apache Spark](https://spark.apache.org/docs/latest/api/java/org/apache/spark/sql/streaming/Trigger.html) eliminating the one-run-late output problem that plagued `Trigger.Once`. [The Mail Archive](https://www.mail-archive.com/dev@spark.apache.org/msg29262.html) The biggest operational risks are the backfill trap (progressive watermark advancement dropping historical data) and the full-refresh requirement when changing watermark logic. [Databricks Documentation](https://docs.databricks.com/gcp/en/ldp/best-practices) Both are mitigable with `withEventTimeOrder`, thoughtful threshold selection, [Databricks](https://docs.databricks.com/aws/en/ldp/stateful-processing) and the medallion architecture pattern that preserves raw data upstream of stateful operations. [Microsoft Learn](https://learn.microsoft.com/en-us/azure/databricks/ldp/stateful-processing)
